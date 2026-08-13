@@ -52,6 +52,12 @@ impl QueueStore {
         Ok(result)
     }
 
+    pub fn count(&self) -> Result<i64> {
+        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM queue")?;
+        stmt.next()?;
+        Ok(stmt.read::<i64, _>(0)?)
+    }
+
     pub fn remove_batch(&self, ids: &[i64]) -> Result<()> {
         for id in ids {
             self.remove(*id)?;
@@ -69,6 +75,13 @@ impl QueueStore {
     pub fn increase_retry(&self, id: i64) -> Result<()> {
         let mut stmt = self.conn.prepare("UPDATE queue SET retry_count = retry_count + 1, last_retry_at = strftime('%s','now') WHERE id=?")?;
         stmt.bind((1, id))?;
+        stmt.next()?;
+        Ok(())
+    }
+
+    pub fn trim_oldest(&self, keep: i64) -> Result<()> {
+        let mut stmt = self.conn.prepare("DELETE FROM queue WHERE id NOT IN (SELECT id FROM queue ORDER BY id DESC LIMIT ?)")?;
+        stmt.bind((1, keep))?;
         stmt.next()?;
         Ok(())
     }
