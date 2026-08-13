@@ -1,0 +1,27 @@
+# loghub-agent configuration example
+
+[server]
+url = "http://localhost:8080"
+# token = "replace-me"
+
+[agent]
+name = "node-01"
+heartbeat_interval_secs = 30
+
+[collector.docker]
+enabled = true
+socket = "/var/run/docker.sock"
+
+[collector.systemd]
+enabled = true
+units = [
+  "docker.service",
+  "postgresql.service"
+]
+
+[buffer]
+# Local durable queue for temporary network failures
+enabled = true
+path = "/var/lib/loghub-agent/queue.db"
+max_size_mb = 1024
+retry_interval_secs = 10
