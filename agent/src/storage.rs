@@ -7,6 +7,7 @@ use sqlite::{Connection, State};
 pub struct QueueItem {
     pub id: i64,
     pub payload: Value,
+    pub retry_count: i64,
 }
 
 pub struct QueueStore {
@@ -21,6 +22,8 @@ impl QueueStore {
              CREATE TABLE IF NOT EXISTS queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 payload TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_retry_at INTEGER,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
              );",
         )?;
@@ -35,21 +38,15 @@ impl QueueStore {
         Ok(())
     }
 
-    pub fn push_batch(&self, payloads: &[Value]) -> Result<()> {
-        for payload in payloads {
-            self.push(payload)?;
-        }
-        Ok(())
-    }
-
     pub fn list(&self, limit: i32) -> Result<Vec<QueueItem>> {
-        let mut stmt = self.conn.prepare("SELECT id,payload FROM queue ORDER BY id LIMIT ?")?;
+        let mut stmt = self.conn.prepare("SELECT id,payload,retry_count FROM queue ORDER BY id LIMIT ?")?;
         stmt.bind((1, limit))?;
         let mut result = Vec::new();
         while let State::Row = stmt.next()? {
             result.push(QueueItem {
                 id: stmt.read::<i64, _>(0)?,
                 payload: serde_json::from_str(stmt.read::<String, _>(1)?.as_str())?,
+                retry_count: stmt.read::<i64, _>(2)?,
             });
         }
         Ok(result)
@@ -64,6 +61,13 @@ impl QueueStore {
 
     pub fn remove(&self, id: i64) -> Result<()> {
         let mut stmt = self.conn.prepare("DELETE FROM queue WHERE id=?")?;
+        stmt.bind((1, id))?;
+        stmt.next()?;
+        Ok(())
+    }
+
+    pub fn increase_retry(&self, id: i64) -> Result<()> {
+        let mut stmt = self.conn.prepare("UPDATE queue SET retry_count = retry_count + 1, last_retry_at = strftime('%s','now') WHERE id=?")?;
         stmt.bind((1, id))?;
         stmt.next()?;
         Ok(())
