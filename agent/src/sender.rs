@@ -13,16 +13,24 @@ struct QueuePayload {
     logs: Vec<Value>,
 }
 
+const BATCH_SIZE: i32 = 200;
+const LEASE_SECONDS: i64 = 30;
+
+fn retry_delay(retry_count: i64) -> Duration {
+    let seconds = (2_i64.pow(retry_count.min(5) as u32)).min(60);
+    Duration::from_secs(seconds as u64)
+}
+
 pub async fn run_sender(config: Config, queue: QueueStore) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
 
     loop {
-        let items = queue.list(200)?;
+        let items = queue.reserve_batch(BATCH_SIZE, LEASE_SECONDS)?;
 
         if items.is_empty() {
-            sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(3)).await;
             continue;
         }
 
@@ -42,21 +50,23 @@ pub async fn run_sender(config: Config, queue: QueueStore) -> Result<()> {
         match request.send().await {
             Ok(resp) if resp.status().is_success() => {
                 queue.remove_batch(&ids)?;
-                info!(count = ids.len(), "flushed queued logs");
+                info!(count = ids.len(), "acknowledged queued logs");
             }
             Ok(resp) => {
                 warn!(status = %resp.status(), "log upload rejected");
-                for id in ids {
-                    queue.increase_retry(id)?;
+                for item in items {
+                    queue.increase_retry(item.id)?;
                 }
-                sleep(Duration::from_secs(5)).await;
+                let max_retry = items.iter().map(|x| x.retry_count).max().unwrap_or(0);
+                sleep(retry_delay(max_retry)).await;
             }
             Err(err) => {
                 warn!(error = %err, "log upload failed");
-                for id in ids {
-                    queue.increase_retry(id)?;
+                for item in items {
+                    queue.increase_retry(item.id)?;
                 }
-                sleep(Duration::from_secs(5)).await;
+                let max_retry = ids.len() as i64;
+                sleep(retry_delay(max_retry)).await;
             }
         }
     }
