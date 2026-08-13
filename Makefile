@@ -1,4 +1,4 @@
-.PHONY: help build check fmt test server agent up down logs clean docker-agent docker-agent-build run-agent
+.PHONY: help build check fmt test server agent web up down logs clean docker-agent docker-agent-build run-agent
 
 help:
 	@echo "LogHub Agent 命令："
@@ -6,9 +6,10 @@ help:
 	@echo "  make check              cargo check"
 	@echo "  make fmt                格式化 Rust 代码"
 	@echo "  make test               运行测试"
-	@echo "  make up                 启动 PostgreSQL + Server"
+	@echo "  make up                 启动 PostgreSQL + Server + Web"
 	@echo "  make down               停止 Docker Compose 服务"
 	@echo "  make logs               查看 Server 日志"
+	@echo "  make web                本地启动 Web 开发服务器"
 	@echo "  make server             本地启动 Server"
 	@echo "  make agent              本地启动 Agent"
 	@echo "  make docker-agent-build  构建 Agent Docker 镜像"
@@ -35,6 +36,9 @@ down:
 
 logs:
 	docker compose logs -f server
+
+web:
+	cd web && npm install && npm run dev
 
 server:
 	cargo run --release -p loghub-server
