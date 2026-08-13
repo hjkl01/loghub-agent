@@ -64,7 +64,7 @@ async fn systemd_collector(tx: mpsc::Sender<LogRecord>, host: String, units: Vec
                 if let Ok(v) = serde_json::from_str::<Value>(&line) {
                     let ts = v.get("__REALTIME_TIMESTAMP").and_then(Value::as_str).and_then(|x| x.parse::<i64>().ok()).and_then(|x| DateTime::from_timestamp_micros(x)).unwrap_or_else(Utc::now);
                     let msg = v.get("MESSAGE").and_then(Value::as_str).unwrap_or("").to_string();
-                    let priority = v.get("PRIORITY").and_then(Value::as_str).map(|p| match p { "0"|"1"|"2" => "error", "3" => "error", "4" => "warning", "5"|"6" => "info", _ => "debug" }.to_string());
+                    let priority = v.get("PRIORITY").and_then(Value::as_str).map(|p| match p { "0"|"1"|"2"|"3" => "error", "4" => "warning", "5"|"6" => "info", _ => "debug" }.to_string());
                     let record = LogRecord { log_time: ts, host: host2.clone(), source_type: "systemd".into(), source_name: unit.clone(), category: None, level: priority, message: msg, metadata: v };
                     if tx2.send(record).await.is_err() { break; }
                 }
@@ -75,8 +75,10 @@ async fn systemd_collector(tx: mpsc::Sender<LogRecord>, host: String, units: Vec
 }
 
 async fn discover_units() -> Vec<String> {
-    let output = Command::new("systemctl").args(["list-units", "--type=service", "--all", "--no-legend", "--no-pager"]).output().await;
-    output.ok().map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.split_whitespace().next().map(str::to_string)).collect()).unwrap_or_default()
+    // Use journalctl instead of systemctl so the same discovery works inside a
+    // container with the host journal mounted read-only.
+    let output = Command::new("journalctl").args(["-F", "_SYSTEMD_UNIT", "--no-pager"]).output().await;
+    output.ok().map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect()).unwrap_or_default()
 }
 
 #[tokio::main]
