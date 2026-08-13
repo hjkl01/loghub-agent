@@ -17,19 +17,28 @@ impl QueueStore {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS queue (
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE IF NOT EXISTS queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 payload TEXT NOT NULL,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-            )",
+             );",
         )?;
         Ok(Self { conn })
     }
 
     pub fn push(&self, payload: &Value) -> Result<()> {
+        let payload = payload.to_string();
         let mut stmt = self.conn.prepare("INSERT INTO queue(payload) VALUES(?)")?;
-        stmt.bind((1, payload.to_string().as_str()))?;
+        stmt.bind((1, payload.as_str()))?;
         stmt.next()?;
+        Ok(())
+    }
+
+    pub fn push_batch(&self, payloads: &[Value]) -> Result<()> {
+        for payload in payloads {
+            self.push(payload)?;
+        }
         Ok(())
     }
 
@@ -44,6 +53,13 @@ impl QueueStore {
             });
         }
         Ok(result)
+    }
+
+    pub fn remove_batch(&self, ids: &[i64]) -> Result<()> {
+        for id in ids {
+            self.remove(*id)?;
+        }
+        Ok(())
     }
 
     pub fn remove(&self, id: i64) -> Result<()> {
