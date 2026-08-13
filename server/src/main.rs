@@ -15,16 +15,17 @@ use uuid::Uuid;
 #[derive(Debug, Deserialize)] struct IngestRequest { logs: Vec<IncomingLog> }
 #[derive(Debug, Deserialize)] struct IncomingLog { log_time: DateTime<Utc>, host: String, source_type: String, source_name: String, category: Option<String>, level: Option<String>, message: String, #[serde(default)] metadata: Value }
 #[derive(Debug, Deserialize)] struct LogQuery { start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, host: Option<String>, source_type: Option<String>, source_name: Option<String>, category: Option<String>, level: Option<String>, keyword: Option<String>, limit: Option<i64>, offset: Option<i64> }
-#[derive(Debug, Serialize, sqlx::FromRow)] struct LogRule { id: Uuid, source_type: Option<String>, source_pattern: Option<String>, category: String, priority: i32, enabled: bool }
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)] struct LogRule { id: Uuid, source_type: Option<String>, source_pattern: Option<String>, category: String, priority: i32, enabled: bool }
 #[derive(Debug, Deserialize)] struct RuleRequest { source_type: Option<String>, source_pattern: Option<String>, category: String, priority: Option<i32>, enabled: Option<bool> }
 #[derive(Serialize)] struct ListResponse { logs: Vec<LogEvent> }
 
 async fn ingest(State(state): State<Arc<AppState>>, Json(req): Json<IngestRequest>) -> impl IntoResponse {
+    let rules = load_rules(&state.pool).await.unwrap_or_default();
     let mut inserted = Vec::with_capacity(req.logs.len());
     for item in req.logs {
         let id = Uuid::new_v4();
         let fallback = item.category.unwrap_or_else(|| "system".into());
-        let category = classify_with_rules(&state.pool, &item.source_type, &item.source_name).await.unwrap_or(fallback);
+        let category = classify(&rules, &item.source_type, &item.source_name).unwrap_or(fallback);
         let log = LogEvent { id, log_time: item.log_time, ingest_time: Utc::now(), host: item.host, source_type: item.source_type, source_name: item.source_name, category, level: item.level, message: item.message, metadata: item.metadata };
         let result = sqlx::query("INSERT INTO logs (id, log_time, ingest_time, host, source_type, source_name, category, level, message, metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
             .bind(log.id).bind(log.log_time).bind(log.ingest_time).bind(&log.host).bind(&log.source_type).bind(&log.source_name).bind(&log.category).bind(&log.level).bind(&log.message).bind(&log.metadata).execute(&state.pool).await;
@@ -33,14 +34,16 @@ async fn ingest(State(state): State<Arc<AppState>>, Json(req): Json<IngestReques
     Json(serde_json::json!({"accepted": inserted.len()}))
 }
 
-async fn classify_with_rules(pool: &PgPool, source_type: &str, source_name: &str) -> Option<String> {
-    let rules: Vec<LogRule> = sqlx::query_as("SELECT id, source_type, source_pattern, category, priority, enabled FROM log_rules WHERE enabled = TRUE ORDER BY priority DESC, id")
-        .fetch_all(pool).await.ok()?;
-    rules.into_iter().find(|r| {
+async fn load_rules(pool: &PgPool) -> Result<Vec<LogRule>, sqlx::Error> {
+    sqlx::query_as("SELECT id, source_type, source_pattern, category, priority, enabled FROM log_rules WHERE enabled = TRUE ORDER BY priority DESC, id").fetch_all(pool).await
+}
+
+fn classify(rules: &[LogRule], source_type: &str, source_name: &str) -> Option<String> {
+    rules.iter().find(|r| {
         let type_ok = r.source_type.as_deref().map(|v| v == source_type).unwrap_or(true);
         let pattern_ok = r.source_pattern.as_deref().map(|p| wildcard_match(p, source_name)).unwrap_or(true);
         type_ok && pattern_ok
-    }).map(|r| r.category)
+    }).map(|r| r.category.clone())
 }
 
 fn wildcard_match(pattern: &str, value: &str) -> bool {
@@ -73,23 +76,23 @@ async fn delete_rule(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -
 async fn reclassify(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let rows: Vec<LogEvent> = match sqlx::query_as("SELECT id, log_time, ingest_time, host, source_type, source_name, category, level, message, metadata FROM logs")
         .fetch_all(&state.pool).await { Ok(rows) => rows, Err(e) => { tracing::error!(error=%e, "读取历史日志失败"); return Json(serde_json::json!({"success":false,"updated":0,"error":"读取历史日志失败"})); } };
+    let total = rows.len();
+    let rules = match load_rules(&state.pool).await { Ok(rules) => rules, Err(e) => { tracing::error!(error=%e, "读取分类规则失败"); return Json(serde_json::json!({"success":false,"updated":0,"error":"读取分类规则失败"})); } };
     let mut updated = 0usize;
     for log in rows {
-        if let Some(category) = classify_with_rules(&state.pool, &log.source_type, &log.source_name).await {
-            if category != log.category {
-                if sqlx::query("UPDATE logs SET category=$1 WHERE id=$2").bind(&category).bind(log.id).execute(&state.pool).await.is_ok() { updated += 1; }
-            }
+        if let Some(category) = classify(&rules, &log.source_type, &log.source_name) {
+            if category != log.category && sqlx::query("UPDATE logs SET category=$1 WHERE id=$2").bind(&category).bind(log.id).execute(&state.pool).await.is_ok() { updated += 1; }
         }
     }
-    let _ = state.tx.send(LogEvent { id: Uuid::nil(), log_time: Utc::now(), ingest_time: Utc::now(), host: "__system__".into(), source_type: "system".into(), source_name: "reclassify".into(), category: "system".into(), level: Some("info".into()), message: format!("历史日志重新分类完成，共更新 {} 条", updated), metadata: serde_json::json!({"updated": updated}) });
-    Json(serde_json::json!({"success":true,"updated":updated,"total":rows.len()}))
+    info!(total, updated, "历史日志重新分类完成");
+    Json(serde_json::json!({"success":true,"updated":updated,"total":total}))
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse { ws.on_upgrade(move |socket| websocket(socket, state)) }
 async fn websocket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut rx=state.tx.subscribe(); let mut filter: Option<WsFilter>=None;
     loop { tokio::select! {
-        msg=rx.recv()=>match msg { Ok(log)=>{ if log.id != Uuid::nil() && filter.as_ref().map(|f|f.matches(&log)).unwrap_or(true) { if socket.send(Message::Text(serde_json::to_string(&log).unwrap().into())).await.is_err(){break;} } }, Err(broadcast::error::RecvError::Lagged(_))=>continue, Err(_)=>break },
+        msg=rx.recv()=>match msg { Ok(log)=>{ if filter.as_ref().map(|f|f.matches(&log)).unwrap_or(true) { if socket.send(Message::Text(serde_json::to_string(&log).unwrap().into())).await.is_err(){break;} } }, Err(broadcast::error::RecvError::Lagged(_))=>continue, Err(_)=>break },
         incoming=socket.next()=>match incoming { Some(Ok(Message::Text(text)))=>{ if let Ok(f)=serde_json::from_str::<WsFilter>(&text){filter=Some(f);} }, Some(Ok(Message::Close(_)))|None=>break, _=>{} }
     }}
 }
