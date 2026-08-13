@@ -17,3 +17,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 sqlite = "0.36"
 serde_with = "3"
+toml = "0.8"
