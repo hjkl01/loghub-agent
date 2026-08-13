@@ -24,6 +24,16 @@ services:
     ports:
       - "8080:8080"
 
+  web:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.web
+    depends_on:
+      - server
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+
   agent:
     build:
       context: .
@@ -33,7 +43,6 @@ services:
       LOGHUB_SERVER_URL: http://server:8080
       LOGHUB_HOSTNAME: ${LOGHUB_HOSTNAME:-docker-host}
       RUST_LOG: ${RUST_LOG:-info}
-      # 建议在容器环境中显式指定需要采集的 systemd unit。
       SYSTEMD_UNITS: ${SYSTEMD_UNITS:-docker.service}
     depends_on:
       - server
