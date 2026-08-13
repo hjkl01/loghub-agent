@@ -32,13 +32,8 @@ struct IngestRequest { logs: Vec<IncomingLog> }
 
 #[derive(Debug, Deserialize)]
 struct IncomingLog {
-    log_time: DateTime<Utc>,
-    host: String,
-    source_type: String,
-    source_name: String,
-    category: Option<String>,
-    level: Option<String>,
-    message: String,
+    log_time: DateTime<Utc>, host: String, source_type: String, source_name: String,
+    category: Option<String>, level: Option<String>, message: String,
     #[serde(default)] metadata: Value,
 }
 
@@ -48,6 +43,12 @@ struct LogQuery {
     host: Option<String>, source_type: Option<String>, source_name: Option<String>,
     category: Option<String>, level: Option<String>, keyword: Option<String>,
     limit: Option<i64>, offset: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WsFilter {
+    host: Option<String>, source_type: Option<String>, source_name: Option<String>,
+    category: Option<String>, level: Option<String>, keyword: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -80,12 +81,41 @@ async fn categories(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse { ws.on_upgrade(move |socket| websocket(socket, state)) }
 
+fn matches_filter(log: &LogEvent, filter: &WsFilter) -> bool {
+    if filter.host.as_deref().is_some_and(|v| log.host != v) { return false; }
+    if filter.source_type.as_deref().is_some_and(|v| log.source_type != v) { return false; }
+    if filter.source_name.as_deref().is_some_and(|v| log.source_name != v) { return false; }
+    if filter.category.as_deref().is_some_and(|v| log.category != v) { return false; }
+    if filter.level.as_deref().is_some_and(|v| log.level.as_deref() != Some(v)) { return false; }
+    if filter.keyword.as_deref().is_some_and(|v| !log.message.to_ascii_lowercase().contains(&v.to_ascii_lowercase())) { return false; }
+    true
+}
+
 async fn websocket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut rx = state.tx.subscribe();
-    loop { tokio::select! {
-        msg = rx.recv() => match msg { Ok(log) => if socket.send(Message::Text(serde_json::to_string(&log).unwrap().into())).await.is_err() { break }, Err(broadcast::error::RecvError::Lagged(_)) => continue, Err(_) => break },
-        incoming = socket.next() => if incoming.is_none() { break },
-    }}
+    let mut filter = WsFilter::default();
+    loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Ok(log) => {
+                    if matches_filter(&log, &filter) {
+                        if socket.send(Message::Text(serde_json::to_string(&log).unwrap().into())).await.is_err() { break; }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            },
+            incoming = socket.next() => match incoming {
+                Some(Ok(Message::Text(text))) => match serde_json::from_str::<WsFilter>(&text) {
+                    Ok(new_filter) => filter = new_filter,
+                    Err(_) => {}
+                },
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {}
+                Some(Err(_)) => break,
+            },
+        }
+    }
 }
 
 fn classify(source_type: &str, source_name: &str) -> String {
