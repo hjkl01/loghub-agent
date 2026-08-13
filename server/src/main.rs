@@ -1,0 +1,111 @@
+use axum::{extract::{State, WebSocketUpgrade, ws::{Message, WebSocket}}, response::IntoResponse, routing::{get, post}, Json, Router};
+use chrono::{DateTime, Utc};
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::{env, net::SocketAddr, sync::Arc};
+use tokio::sync::broadcast;
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tracing::info;
+use uuid::Uuid;
+
+#[derive(Clone)]
+struct AppState { pool: PgPool, tx: broadcast::Sender<LogEvent> }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+struct LogEvent {
+    id: Uuid,
+    log_time: DateTime<Utc>,
+    ingest_time: DateTime<Utc>,
+    host: String,
+    source_type: String,
+    source_name: String,
+    category: String,
+    level: Option<String>,
+    message: String,
+    metadata: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct IngestRequest { logs: Vec<IncomingLog> }
+
+#[derive(Debug, Deserialize)]
+struct IncomingLog {
+    log_time: DateTime<Utc>,
+    host: String,
+    source_type: String,
+    source_name: String,
+    category: Option<String>,
+    level: Option<String>,
+    message: String,
+    #[serde(default)] metadata: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogQuery {
+    start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>,
+    host: Option<String>, source_type: Option<String>, source_name: Option<String>,
+    category: Option<String>, level: Option<String>, keyword: Option<String>,
+    limit: Option<i64>, offset: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct ListResponse { logs: Vec<LogEvent> }
+
+async fn ingest(State(state): State<Arc<AppState>>, Json(req): Json<IngestRequest>) -> impl IntoResponse {
+    let mut inserted = Vec::with_capacity(req.logs.len());
+    for item in req.logs {
+        let id = Uuid::new_v4();
+        let category = item.category.unwrap_or_else(|| classify(&item.source_type, &item.source_name));
+        let log = LogEvent { id, log_time: item.log_time, ingest_time: Utc::now(), host: item.host, source_type: item.source_type, source_name: item.source_name, category, level: item.level, message: item.message, metadata: item.metadata };
+        let result = sqlx::query("INSERT INTO logs (id, log_time, ingest_time, host, source_type, source_name, category, level, message, metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
+            .bind(log.id).bind(log.log_time).bind(log.ingest_time).bind(&log.host).bind(&log.source_type).bind(&log.source_name).bind(&log.category).bind(&log.level).bind(&log.message).bind(&log.metadata).execute(&state.pool).await;
+        if result.is_ok() { let _ = state.tx.send(log.clone()); inserted.push(log); }
+    }
+    Json(serde_json::json!({"accepted": inserted.len()}))
+}
+
+async fn logs(State(state): State<Arc<AppState>>, axum::extract::Query(q): axum::extract::Query<LogQuery>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000); let offset = q.offset.unwrap_or(0).max(0);
+    let rows = sqlx::query_as::<_, LogEvent>("SELECT id, log_time, ingest_time, host, source_type, source_name, category, level, message, metadata FROM logs WHERE ($1::timestamptz IS NULL OR log_time >= $1) AND ($2::timestamptz IS NULL OR log_time <= $2) AND ($3::text IS NULL OR host = $3) AND ($4::text IS NULL OR source_type = $4) AND ($5::text IS NULL OR source_name = $5) AND ($6::text IS NULL OR category = $6) AND ($7::text IS NULL OR level = $7) AND ($8::text IS NULL OR message ILIKE '%' || $8 || '%') ORDER BY log_time DESC LIMIT $9 OFFSET $10")
+        .bind(q.start).bind(q.end).bind(q.host).bind(q.source_type).bind(q.source_name).bind(q.category).bind(q.level).bind(q.keyword).bind(limit).bind(offset).fetch_all(&state.pool).await.unwrap_or_default();
+    Json(ListResponse { logs: rows })
+}
+
+async fn categories(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT DISTINCT category FROM logs ORDER BY category").fetch_all(&state.pool).await.unwrap_or_default();
+    Json(rows.into_iter().map(|x| x.0).collect::<Vec<_>>())
+}
+
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse { ws.on_upgrade(move |socket| websocket(socket, state)) }
+
+async fn websocket(mut socket: WebSocket, state: Arc<AppState>) {
+    let mut rx = state.tx.subscribe();
+    loop { tokio::select! {
+        msg = rx.recv() => match msg { Ok(log) => if socket.send(Message::Text(serde_json::to_string(&log).unwrap().into())).await.is_err() { break }, Err(broadcast::error::RecvError::Lagged(_)) => continue, Err(_) => break },
+        incoming = socket.next() => if incoming.is_none() { break },
+    }}
+}
+
+fn classify(source_type: &str, source_name: &str) -> String {
+    let n = source_name.to_ascii_lowercase();
+    if n.contains("postgres") || n.contains("mysql") || n.contains("redis") || n.contains("mongo") { "database".into() }
+    else if n.contains("nginx") || n.contains("caddy") || n.contains("apache") { "web".into() }
+    else if source_type == "docker" { "container".into() }
+    else if n.contains("ssh") || n.contains("auth") { "security".into() }
+    else { "system".into() }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_env_filter(env::var("RUST_LOG").unwrap_or_else(|_| "info".into())).init();
+    let database_url = env::var("DATABASE_URL")?;
+    let pool = PgPoolOptions::new().max_connections(20).connect(&database_url).await?;
+    let (tx, _) = broadcast::channel(2048);
+    let state = Arc::new(AppState { pool, tx });
+    let app = Router::new().route("/health", get(|| async { "ok" })).route("/api/agent/logs", post(ingest)).route("/api/logs", get(logs)).route("/api/logs/categories", get(categories)).route("/api/logs/ws", get(ws_handler)).layer(CorsLayer::permissive()).layer(TraceLayer::new_for_http()).with_state(state);
+    let addr: SocketAddr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into()).parse()?;
+    info!(%addr, "loghub server started");
+    let listener = tokio::net::TcpListener::bind(addr).await?; axum::serve(listener, app).await?; Ok(())
+}
