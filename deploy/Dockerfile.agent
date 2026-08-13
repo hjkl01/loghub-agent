@@ -1,0 +1,21 @@
+FROM rust:1.88-bookworm AS builder
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock* ./
+COPY agent ./agent
+COPY server ./server
+
+RUN cargo build --release -p loghub-agent
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends systemd systemd-sysv ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/loghub-agent /usr/local/bin/loghub-agent
+
+ENV LOGHUB_SERVER_URL=http://server:8080
+ENV RUST_LOG=info
+
+ENTRYPOINT ["/usr/local/bin/loghub-agent"]
