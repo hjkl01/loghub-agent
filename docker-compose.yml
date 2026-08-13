@@ -24,5 +24,26 @@ services:
     ports:
       - "8080:8080"
 
+  agent:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.agent
+    profiles: ["agent"]
+    environment:
+      LOGHUB_SERVER_URL: http://server:8080
+      LOGHUB_HOSTNAME: ${LOGHUB_HOSTNAME:-docker-host}
+      RUST_LOG: ${RUST_LOG:-info}
+      # 建议在容器环境中显式指定需要采集的 systemd unit。
+      SYSTEMD_UNITS: ${SYSTEMD_UNITS:-docker.service}
+    depends_on:
+      - server
+    user: "0:0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/log/journal:/run/log/journal:ro
+      - /var/log/journal:/var/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+    restart: unless-stopped
+
 volumes:
   postgres-data:
