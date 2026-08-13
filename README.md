@@ -30,16 +30,66 @@ Docker / systemd journal
 - 使用 PostgreSQL 存储日志，并针对时间、来源、分类、级别建立索引。
 - 提供基础的自动日志分类能力。
 - 通过 WebSocket 实时推送新接收的日志。
-- 使用 Docker Compose 部署 Server + PostgreSQL。
-- 提供 Agent 的 systemd 服务示例。
+- 支持 Server + PostgreSQL Docker Compose 部署。
+- Agent 同时支持直接运行和 Docker 运行。
+- 提供 Makefile 统一管理常用开发、构建和部署命令。
 - 提供 GitHub Actions Rust CI。
 
 ## 快速开始
 
+### 使用 Makefile
+
+项目提供 Makefile，建议直接使用：
+
+```bash
+make help
+```
+
+常用命令：
+
+```bash
+# 编译 Server 和 Agent
+make build
+
+# 检查代码
+make check
+
+# 格式化代码
+make fmt
+
+# 运行测试
+make test
+
+# 启动 PostgreSQL + Server
+a make up
+
+# 停止服务
+make down
+
+# 查看 Server 日志
+make logs
+
+# 本地启动 Server
+make server
+
+# 本地启动 Agent
+make agent
+```
+
+> `make up` 依赖 Docker 和 Docker Compose。
+
 ### 1. 启动 Server 和 PostgreSQL
+
+直接使用 Docker Compose：
 
 ```bash
 docker compose up -d --build
+```
+
+或者：
+
+```bash
+make up
 ```
 
 API 默认监听：`http://127.0.0.1:8080`。
@@ -50,27 +100,112 @@ API 默认监听：`http://127.0.0.1:8080`。
 curl http://127.0.0.1:8080/health
 ```
 
-### 2. 编译 Agent
+## Agent 运行方式
 
-Agent 必须运行在需要采集 Docker 和 systemd 日志的 Linux 主机上。
+Agent 支持两种运行方式：
+
+1. **直接运行在 Linux 主机上**：推荐用于生产环境和权限要求较严格的场景。
+2. **运行在 Docker 容器中**：适合已经使用 Docker 管理基础服务的服务器。
+
+### 方式一：直接运行 Agent
+
+编译：
 
 ```bash
 cargo build --release -p loghub-agent
 ```
 
-采集 Docker 日志时，Agent 需要访问 Docker Socket。直接作为主机进程运行时，通常需要访问 `/var/run/docker.sock`。
+或者：
 
-采集 systemd 日志时，Agent 会调用 `journalctl`。运行 Agent 的用户需要具备读取 journal 的权限；在很多发行版中，这通常意味着需要加入 `systemd-journal` 用户组。
+```bash
+make build
+```
 
-### 3. 配置 Agent
+配置：
 
 ```bash
 export LOGHUB_SERVER_URL=http://127.0.0.1:8080
 export LOGHUB_HOSTNAME=$(hostname)
-# 可选。如果不设置，将自动发现当前系统中安装的所有 service unit。
 export SYSTEMD_UNITS=docker.service,caddy.service,postgresql.service
+```
+
+启动：
+
+```bash
 ./target/release/loghub-agent
 ```
+
+采集 Docker 日志时，Agent 需要访问 `/var/run/docker.sock`。
+
+采集 systemd 日志时，Agent 会调用 `journalctl`，运行用户需要具备读取 journal 的权限；很多发行版可以通过加入 `systemd-journal` 用户组解决。
+
+### 方式二：使用 Docker 运行 Agent
+
+**可以。** Agent 已提供独立的 Dockerfile，并且 Docker Compose 已提供 `agent` profile。
+
+Docker 运行 Agent 时，需要把宿主机的 Docker Socket 和 systemd journal 目录挂载进去：
+
+```text
+/var/run/docker.sock
+/run/log/journal
+/var/log/journal
+/etc/machine-id
+```
+
+这些挂载允许容器中的 Agent 读取宿主机 Docker 和 systemd 日志。
+
+#### 使用 Compose 启动
+
+先启动 Server 和 PostgreSQL：
+
+```bash
+make up
+```
+
+然后启动 Agent：
+
+```bash
+make docker-agent
+```
+
+等价于：
+
+```bash
+docker compose --profile agent up -d --build agent
+```
+
+查看 Agent 日志：
+
+```bash
+docker compose logs -f agent
+```
+
+#### 配置需要采集的 systemd 服务
+
+Docker 环境下建议显式指定 `SYSTEMD_UNITS`：
+
+```bash
+export SYSTEMD_UNITS=docker.service,caddy.service,postgresql.service
+make docker-agent
+```
+
+也可以写入 `.env`：
+
+```env
+LOGHUB_HOSTNAME=server-01
+SYSTEMD_UNITS=docker.service,caddy.service,postgresql.service
+RUST_LOG=info
+```
+
+然后：
+
+```bash
+make docker-agent
+```
+
+如果不设置 `SYSTEMD_UNITS`，Agent 会尝试通过宿主机 journal 中的 `_SYSTEMD_UNIT` 字段自动发现日志单元。
+
+> Docker Agent 默认以 root 用户运行，因为需要读取 Docker Socket 和宿主机 journal。请注意，访问 `/var/run/docker.sock` 本身就相当于授予较高的宿主机权限。
 
 ## API
 
@@ -143,10 +278,10 @@ ws://127.0.0.1:8080/api/logs/ws
 例如：
 
 ```text
-docker / postgres*     → database
-docker / redis*        → database
-docker / nginx*        → web
-systemd / ssh.service  → security
+docker / postgres*      → database
+docker / redis*         → database
+docker / nginx*         → web
+systemd / ssh.service   → security
 systemd / caddy.service → web
 ```
 
@@ -164,8 +299,9 @@ loghub-agent/
 │   └── WebSocket
 │
 ├── migrations/         # PostgreSQL 数据库迁移
-├── deploy/             # 部署相关文件
+├── deploy/             # Dockerfile / 部署文件
 ├── config/             # 配置文件示例
+├── Makefile             # 常用开发和部署命令
 └── .github/workflows/  # GitHub Actions
 ```
 
