@@ -14,6 +14,8 @@ pub struct QueueStore {
     conn: Connection,
 }
 
+const DEFAULT_MAX_QUEUE_SIZE: i64 = 100_000;
+
 impl QueueStore {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -32,6 +34,10 @@ impl QueueStore {
     }
 
     pub fn push(&self, payload: &Value) -> Result<()> {
+        if self.count()? >= DEFAULT_MAX_QUEUE_SIZE {
+            self.trim_oldest(DEFAULT_MAX_QUEUE_SIZE - 1)?;
+        }
+
         let payload = payload.to_string();
         let mut stmt = self.conn.prepare("INSERT INTO queue(payload) VALUES(?)")?;
         stmt.bind((1, payload.as_str()))?;
