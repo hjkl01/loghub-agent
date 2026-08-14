@@ -53,19 +53,20 @@ pub async fn run_sender(config: Config, queue: QueueStore) -> Result<()> {
                 info!(count = ids.len(), "acknowledged queued logs");
             }
             Ok(resp) => {
-                warn!(status = %resp.status(), "log upload rejected");
-                for item in items {
+                let status = resp.status();
+                warn!(%status, "log upload rejected");
+                for item in &items {
                     queue.increase_retry(item.id)?;
                 }
-                let max_retry = items.iter().map(|x| x.retry_count).max().unwrap_or(0);
+                let max_retry = items.iter().map(|x| x.retry_count + 1).max().unwrap_or(1);
                 sleep(retry_delay(max_retry)).await;
             }
             Err(err) => {
                 warn!(error = %err, "log upload failed");
-                for item in items {
+                for item in &items {
                     queue.increase_retry(item.id)?;
                 }
-                let max_retry = ids.len() as i64;
+                let max_retry = items.iter().map(|x| x.retry_count + 1).max().unwrap_or(1);
                 sleep(retry_delay(max_retry)).await;
             }
         }
