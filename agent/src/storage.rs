@@ -15,6 +15,7 @@ pub struct QueueStore {
 }
 
 const DEFAULT_MAX_QUEUE_SIZE: i64 = 100_000;
+const MAX_RETRY_COUNT: i64 = 10;
 
 impl QueueStore {
     pub fn open(path: &str) -> Result<Self> {
@@ -28,6 +29,12 @@ impl QueueStore {
                 last_retry_at INTEGER,
                 locked_until INTEGER,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+             );
+             CREATE TABLE IF NOT EXISTS dead_letter_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload TEXT NOT NULL,
+                retry_count INTEGER NOT NULL,
+                failed_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
              );",
         )?;
         Ok(Self { conn })
@@ -86,8 +93,27 @@ impl QueueStore {
     }
 
     pub fn increase_retry(&self, id: i64) -> Result<()> {
+        let mut stmt = self.conn.prepare("SELECT payload,retry_count FROM queue WHERE id=?")?;
+        stmt.bind((1, id))?;
+        if let State::Row = stmt.next()? {
+            let payload: String = stmt.read(0)?;
+            let retry_count: i64 = stmt.read(1)?;
+            if retry_count + 1 >= MAX_RETRY_COUNT {
+                self.move_to_dead_letter(&payload, retry_count + 1)?;
+                return self.remove(id);
+            }
+        }
+
         let mut stmt = self.conn.prepare("UPDATE queue SET retry_count = retry_count + 1, last_retry_at = strftime('%s','now'), locked_until = NULL WHERE id=?")?;
         stmt.bind((1, id))?;
+        stmt.next()?;
+        Ok(())
+    }
+
+    fn move_to_dead_letter(&self, payload: &str, retry_count: i64) -> Result<()> {
+        let mut stmt = self.conn.prepare("INSERT INTO dead_letter_queue(payload,retry_count) VALUES(?,?)")?;
+        stmt.bind((1, payload))?;
+        stmt.bind((2, retry_count))?;
         stmt.next()?;
         Ok(())
     }
